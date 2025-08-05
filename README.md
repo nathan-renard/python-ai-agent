@@ -1,2 +1,4 @@
-# python-ai-agent
-Academic only, a Python AI Agent using Gemini
+# Python AI Agent
+
+## Descrition
+An AI agent using Gemini that performs some simple tasks meant for academic purposes and practice.
