@@ -3,8 +3,9 @@ import os
 
 def get_files_info(working_directory: str, directory: str = ".") -> str:
     try:
-        working_dir_abs = os.path.abspath(working_directory)
-        target_dir = os.path.normpath(os.path.join(working_dir_abs, directory))
+        # realpath resolves symlinks, so a link inside can't lead outside the working directory
+        working_dir_abs: str = os.path.realpath(working_directory)
+        target_dir: str = os.path.realpath(os.path.join(working_dir_abs, directory))
 
         # Guardrail: the LLM must never reach outside the working directory
         if os.path.commonpath([working_dir_abs, target_dir]) != working_dir_abs:
@@ -15,9 +16,9 @@ def get_files_info(working_directory: str, directory: str = ".") -> str:
 
         entries: list[str] = []
         for name in sorted(os.listdir(target_dir)):
-            path = os.path.join(target_dir, name)
-            file_size = os.path.getsize(path)
-            is_dir = os.path.isdir(path)
+            path: str = os.path.join(target_dir, name)
+            file_size: int = os.path.getsize(path)
+            is_dir: bool = os.path.isdir(path)
             entries.append(f"- {name}: file_size={file_size} bytes, is_dir={is_dir}")
         return "\n".join(entries)
     

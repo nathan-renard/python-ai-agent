@@ -3,23 +3,23 @@ import os
 
 from dotenv import load_dotenv
 from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam
+from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 
 MODEL: str = "openrouter/free"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Chatbot")
+    parser: argparse.ArgumentParser = argparse.ArgumentParser(description="Chatbot")
     parser.add_argument("user_prompt", type=str, help="User prompt")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
-    args = parser.parse_args()
+    args: argparse.Namespace = parser.parse_args()
 
     load_dotenv()
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    api_key: str | None = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not set in the environment variables.")
 
-    client = OpenAI(
+    client: OpenAI = OpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
     )
@@ -30,7 +30,7 @@ def main() -> None:
             "content": args.user_prompt,
         },
     ]
-    response = client.chat.completions.create(
+    response: ChatCompletion = client.chat.completions.create(
         model=MODEL,
         messages=messages,
     )
