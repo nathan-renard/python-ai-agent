@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
-MODEL = "openrouter/free"
+MODEL: str = "openrouter/free"
 
 
 def main() -> None:
