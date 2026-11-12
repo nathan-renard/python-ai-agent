@@ -1,1 +1,2 @@
 MAX_CHARS: int = 10000
+TIMEOUT_SECONDS: int = 30
