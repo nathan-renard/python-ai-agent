@@ -1,13 +1,11 @@
 import argparse
-import json
 import os
-from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletion, ChatCompletionMessage, ChatCompletionMessageParam
 
-from call_function import available_functions
+from call_function import available_functions, call_function
 from prompts import system_prompt
 
 MODEL: str = "openrouter/free"
@@ -51,8 +49,11 @@ def main() -> None:
             # tool_calls can also hold custom tool calls, which have no .function; we only offer functions
             if tool_call.type != "function":
                 continue
-            function_args: dict[str, Any] = json.loads(tool_call.function.arguments or "{}")
-            print(f"Calling function: {tool_call.function.name}({function_args})")
+            result_message: dict[str, str] = call_function(tool_call, args.verbose)
+            if not result_message["content"]:
+                raise RuntimeError(f"Function {tool_call.function.name} returned no content")
+            if args.verbose:
+                print(f"-> {result_message['content']}")
     else:
         print(message.content)
 
