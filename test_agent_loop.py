@@ -492,6 +492,9 @@ def main() -> None:
     results += test_verbose()
     results += test_error_guessing()
     print(f"\n{sum(results)}/{len(results)} checks passed")
+    # A non-zero exit lets CI tell a failing run from a passing one
+    if not all(results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import inspect
 import io
 import json
 import os
+import sys
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import chdir, contextmanager, redirect_stdout
@@ -370,6 +371,9 @@ def main() -> None:
     results += test_working_directory()
     results += test_error_guessing()
     print(f"\n{sum(results)}/{len(results)} checks passed")
+    # A non-zero exit lets CI tell a failing run from a passing one
+    if not all(results):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

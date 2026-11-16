@@ -1,5 +1,9 @@
 # python-ai-agent
 
+[![tests](https://github.com/nathan-renard/python-ai-agent/actions/workflows/tests.yml/badge.svg)](https://github.com/nathan-renard/python-ai-agent/actions/workflows/tests.yml)
+![Python 3.14](https://img.shields.io/badge/python-3.14-blue)
+![mypy strict](https://img.shields.io/badge/mypy-strict-blue)
+
 A command-line coding agent in Python. You describe a task in plain English, and the agent works out which tools to call: it lists folders, reads files, runs Python and writes changes inside one sandboxed project folder, looping with the LLM until it has an answer.
 
 ```console
@@ -63,7 +67,7 @@ Letting a model run code and write files is the risky part, so every tool goes t
 for t in test_*.py; do uv run python "$t"; done
 ```
 
-Each suite prints `PASS`/`FAIL` per check and a total at the end.
+Each suite prints `PASS`/`FAIL` per check and a total, and exits with code 1 if any check failed. GitHub Actions runs `mypy --strict` and all six suites on every push to `main` and on pull requests.
 
 ## Run it
 
