@@ -2,7 +2,11 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from openai.types.chat import ChatCompletionMessageFunctionToolCall, ChatCompletionToolParam
+from openai.types.chat import (
+    ChatCompletionMessageFunctionToolCall,
+    ChatCompletionToolMessageParam,
+    ChatCompletionToolParam,
+)
 
 from functions.get_file_content import get_file_content, schema_get_file_content
 from functions.get_files_info import get_files_info, schema_get_files_info
@@ -24,7 +28,9 @@ function_map: dict[str, Callable[..., str]] = {
 }
 
 
-def call_function(tool_call: ChatCompletionMessageFunctionToolCall, verbose: bool = False) -> dict[str, str]:
+def call_function(
+    tool_call: ChatCompletionMessageFunctionToolCall, verbose: bool = False
+) -> ChatCompletionToolMessageParam:
     function_name: str = tool_call.function.name
     # Some providers send "" or null when there are no arguments
     function_args: dict[str, Any] = json.loads(tool_call.function.arguments or "{}")

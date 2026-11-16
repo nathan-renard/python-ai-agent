@@ -1,31 +1,43 @@
-import importlib
 import inspect
 import io
 import json
 import os
-import sys
 import tempfile
-from collections.abc import Callable
-from contextlib import redirect_stdout
-from types import ModuleType
+from collections.abc import Callable, Iterator
+from contextlib import chdir, contextmanager, redirect_stdout
+from dataclasses import dataclass
 from typing import Any
-from unittest.mock import MagicMock, patch
 
-from openai.types.chat import ChatCompletion, ChatCompletionMessage, ChatCompletionMessageToolCallUnion
-from openai.types.chat.chat_completion import Choice
-from openai.types.chat.chat_completion_message_custom_tool_call import (
-    ChatCompletionMessageCustomToolCall,
-    Custom,
-)
+from openai.types.chat import ChatCompletionToolMessageParam
 from openai.types.chat.chat_completion_message_function_tool_call import (
     ChatCompletionMessageFunctionToolCall,
     Function,
 )
-from openai.types.completion_usage import CompletionUsage
 
-from call_function import available_functions
-from main import main as run_agent
-from prompts import system_prompt
+from call_function import available_functions, call_function, function_map
+from config import MAX_CHARS
+from functions.get_file_content import get_file_content
+from functions.get_files_info import get_files_info
+from functions.run_python_file import run_python_file
+
+# call_function.py injects this, so the tests use it as the oracle for what each function returns
+WORKING_DIR: str = "./calculator"
+
+# Prints the arguments the script received, so tests can see exactly what was passed
+ARGV_SCRIPT: str = "import sys\nprint(sys.argv[1:])\n"
+
+EXPECTED_FUNCTIONS: list[str] = ["get_files_info", "get_file_content", "run_python_file", "write_file"]
+
+
+@dataclass
+class CallResult:
+    message: ChatCompletionToolMessageParam | None  # what call_function returned, None if it raised
+    output: str                                       # what it printed
+    error: Exception | None                           # the exception it let escape, if any
+
+    @property
+    def content(self) -> Any:
+        return self.message["content"] if self.message is not None else None
 
 
 def check(label: str, passed: bool) -> bool:
@@ -33,60 +45,53 @@ def check(label: str, passed: bool) -> bool:
     return passed
 
 
-def fn_call(name: str, arguments: str | None) -> ChatCompletionMessageFunctionToolCall:
+def fn_call(name: str, arguments: str | None, call_id: str = "call_1") -> ChatCompletionMessageFunctionToolCall:
     # model_construct skips validation, so a test can send arguments=None like a sloppy provider might
     return ChatCompletionMessageFunctionToolCall(
-        id=f"call_{name}",
+        id=call_id,
         type="function",
         function=Function.model_construct(name=name, arguments=arguments),
     )
 
 
-def custom_call(name: str) -> ChatCompletionMessageCustomToolCall:
-    # A non-function tool call: the API allows them, but we never offer custom tools
-    return ChatCompletionMessageCustomToolCall(
-        id=f"custom_{name}", type="custom", custom=Custom(name=name, input="x"))
-
-
-def make_response(content: str | None,
-                  tool_calls: list[ChatCompletionMessageToolCallUnion] | None = None) -> ChatCompletion:
-    message: ChatCompletionMessage = ChatCompletionMessage(
-        role="assistant", content=content, tool_calls=tool_calls)
-    return ChatCompletion(
-        id="resp_test",
-        object="chat.completion",
-        created=0,
-        model="test-model",
-        choices=[Choice(index=0, finish_reason="tool_calls" if tool_calls else "stop", message=message)],
-        usage=CompletionUsage(prompt_tokens=12, completion_tokens=3, total_tokens=15),
-    )
-
-
-def run_main(response: ChatCompletion, argv: list[str]) -> tuple[str, dict[str, Any]]:
-    # Runs main.py end to end with a fake model; returns what it printed and what it sent to the model
-    fake_client: MagicMock = MagicMock()
-    fake_client.chat.completions.create.return_value = response
+def call(name: str, arguments: str | None, verbose: bool = False, call_id: str = "call_1") -> CallResult:
     out: io.StringIO = io.StringIO()
-    with (patch.object(sys, "argv", ["main.py", *argv]),
-          patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}),
-          patch("main.OpenAI", return_value=fake_client),
-          redirect_stdout(out)):
-        run_agent()
-    return out.getvalue(), fake_client.chat.completions.create.call_args.kwargs
+    message: ChatCompletionToolMessageParam | None = None
+    error: Exception | None = None
+    with redirect_stdout(out):
+        try:
+            message = call_function(fn_call(name, arguments, call_id), verbose)
+        except Exception as e:
+            error = e
+    return CallResult(message, out.getvalue(), error)
 
 
-def output_for(response: ChatCompletion) -> str:
-    return run_main(response, ["test prompt"])[0]
+def announced(name: str) -> str:
+    return f" - Calling function: {name}\n"
 
 
-def resolve_function(name: str) -> Callable[..., object] | None:
-    # Looks for functions/<name>.py with a function of the same name inside it
-    try:
-        module: ModuleType = importlib.import_module(f"functions.{name}")
-    except ModuleNotFoundError:
-        return None
-    func: object = getattr(module, name, None)
-    return func if callable(func) else None
+def make_fixture(path: str, content: str) -> None:
+    # A bare file name has no folder part, and makedirs("") fails
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+@contextmanager
+def sandbox() -> Iterator[str]:
+    # A throwaway folder with its own calculator/, made the current directory, so
+    # "./calculator" points here and nothing in the real project gets touched
+    with tempfile.TemporaryDirectory() as tmp_root, chdir(tmp_root):
+        make_fixture("calculator/main.py", "print('hello from main')\n")
+        make_fixture("calculator/argv.py", ARGV_SCRIPT)
+        make_fixture("calculator/crash.py", "raise SystemExit('boom')\n")
+        make_fixture("calculator/notes.txt", "some notes\n")
+        make_fixture("calculator/empty.txt", "")
+        make_fixture("calculator/pkg/helper.py", "x = 1\n")
+        make_fixture("calculator/dossier été/fichier.txt", "bonjour\n")
+        os.makedirs("calculator/empty_dir")
+        make_fixture("secret.txt", "top secret\n")  # outside the working directory
+        yield tmp_root
 
 
 def schema_properties(tool: dict[str, Any]) -> dict[str, Any]:
@@ -94,27 +99,38 @@ def schema_properties(tool: dict[str, Any]) -> dict[str, Any]:
 
 
 def test_course_cases() -> list[bool]:
-    # Replies shaped like the ones the real model sent for the course prompts
-    print("=== use cases: course prompts ===")
+    # The real calculator, read-only calls
+    print("=== use cases: calculator/ ===")
     results: list[bool] = []
 
-    # (prompt, arguments the model sent, expected output)
+    # (name, arguments, oracle for the result)
     cases: list[tuple[str, str, str]] = [
-        ("what files are in the root?", '{"directory": "."}',
-         "Calling function: get_files_info({'directory': '.'})\n"),
-        ("what files are in the root?", "{}",
-         "Calling function: get_files_info({})\n"),
-        ("what files are in the pkg directory?", '{"directory": "pkg"}',
-         "Calling function: get_files_info({'directory': 'pkg'})\n"),
+        ("get_files_info", '{"directory": "."}', get_files_info(WORKING_DIR, ".")),
+        ("get_files_info", '{"directory": "pkg"}', get_files_info(WORKING_DIR, "pkg")),
+        ("get_file_content", '{"file_path": "main.py"}', get_file_content(WORKING_DIR, "main.py")),
+        ("run_python_file", '{"file_path": "main.py"}', run_python_file(WORKING_DIR, "main.py")),
+        ("run_python_file", '{"file_path": "main.py", "args": ["3 + 5"]}',
+         run_python_file(WORKING_DIR, "main.py", ["3 + 5"])),
     ]
-    for prompt, arguments, expected in cases:
-        output, _ = run_main(make_response(None, [fn_call("get_files_info", arguments)]), [prompt])
-        print(output, end="")
-        results.append(check(f"{prompt!r}, args {arguments}: announces the call", output == expected))
+    for name, arguments, expected in cases:
+        result: CallResult = call(name, arguments)
+        print(result.output, end="")
+        results.append(check(f"{name} {arguments}: announced, real result returned",
+                             result.output == announced(name) and result.content == expected))
 
-    output, _ = run_main(make_response("2 + 2 = 4"), ["what is 2 + 2?"])
-    print(output, end="")
-    results.append(check("'what is 2 + 2?', no call: prints the answer as normal", output == "2 + 2 = 4\n"))
+    result = call("run_python_file", '{"file_path": "main.py", "args": ["3 + 5"]}')
+    results.append(check("run main.py '3 + 5': the model gets the rendered result",
+                         '"result": 8' in str(result.content)))
+
+    # Writing goes to a sandbox so the real calculator/ stays as it is
+    with sandbox():
+        result = call("write_file", '{"file_path": "README.md", "content": "hello"}')
+        print(result.output, end="")
+        with open("calculator/README.md", encoding="utf-8") as f:
+            written: str = f.read()
+        results.append(check("write_file README.md: file written inside calculator/",
+                             written == "hello"
+                             and result.content == 'Successfully wrote to "README.md" (5 characters written)'))
 
     return results
 
@@ -123,48 +139,48 @@ def test_equivalence_partitions() -> list[bool]:
     print("=== equivalence partitioning ===")
     results: list[bool] = []
 
-    # Reply shape: text only, a call only, a call plus text
-    output: str = output_for(make_response("Just text"))
-    results.append(check("reply: text only -> text printed", output == "Just text\n"))
+    with sandbox():
+        # Output mode: verbose shows the arguments, normal mode only the name
+        result: CallResult = call("get_files_info", '{"directory": "pkg"}')
+        results.append(check("normal mode: name only", result.output == announced("get_files_info")))
+        result = call("get_files_info", '{"directory": "pkg"}', verbose=True)
+        results.append(check("verbose mode: name and arguments",
+                             result.output == " - Calling function: get_files_info({'directory': 'pkg'})\n"))
 
-    output = output_for(make_response(None, [fn_call("get_files_info", '{"directory": "pkg"}')]))
-    results.append(check("reply: one call -> call announced",
-                         output == "Calling function: get_files_info({'directory': 'pkg'})\n"))
+        # Arguments: none, one, several (including a list value)
+        result = call("get_files_info", "{}")
+        results.append(check("no arguments: function defaults used",
+                             result.content == get_files_info(WORKING_DIR)))
+        result = call("get_file_content", '{"file_path": "notes.txt"}')
+        results.append(check("one argument: passed through", result.content == "some notes\n"))
+        result = call("run_python_file", '{"file_path": "argv.py", "args": ["a", "b c"]}')
+        results.append(check("several arguments, list included: passed through",
+                             result.content == "STDOUT:\n['a', 'b c']\n"))
 
-    # Models often say "Let me check..." alongside the call; the text must not be printed
-    output = output_for(make_response("Let me check.", [fn_call("get_files_info", "{}")]))
-    results.append(check("reply: call plus text -> only the call announced",
-                         output == "Calling function: get_files_info({})\n"))
+        # Result kind: success and error text both come back unchanged as content
+        result = call("get_file_content", '{"file_path": "missing.txt"}')
+        results.append(check("error result: returned as content, not raised",
+                             result.error is None
+                             and result.content == get_file_content(WORKING_DIR, "missing.txt")
+                             and str(result.content).startswith("Error:")))
 
-    # Arguments: none, one, several (including a list value)
-    # (label, arguments the model sent, expected output)
-    arg_cases: list[tuple[str, str, str]] = [
-        ("no arguments", "{}", "Calling function: get_files_info({})\n"),
-        ("one argument", '{"directory": "pkg"}',
-         "Calling function: get_files_info({'directory': 'pkg'})\n"),
-        ("several arguments", '{"file_path": "main.py", "args": ["3 + 5"]}',
-         "Calling function: get_files_info({'file_path': 'main.py', 'args': ['3 + 5']})\n"),
-    ]
-    for label, arguments, expected in arg_cases:
-        output = output_for(make_response(None, [fn_call("get_files_info", arguments)]))
-        results.append(check(f"arguments: {label}", output == expected))
+        # Every offered function reaches the real function of the same name
+        for name, arguments in [("get_files_info", '{"directory": "pkg"}'),
+                                ("get_file_content", '{"file_path": "notes.txt"}'),
+                                ("run_python_file", '{"file_path": "main.py"}'),
+                                ("write_file", '{"file_path": "out.txt", "content": "abc"}')]:
+            result = call(name, arguments)
+            expected: str = function_map[name](working_directory=WORKING_DIR, **json.loads(arguments))
+            results.append(check(f"{name}: dispatched to the real {name}()", result.content == expected))
 
-    # What main.py sends to the model
-    _, sent = run_main(make_response("ok"), ["what files are in the root?"])
-    results.append(check("request: the declared tools are offered", sent["tools"] == available_functions))
-    results.append(check("request: system prompt first, then the user prompt",
-                         sent["messages"] == [
-                             {"role": "system", "content": system_prompt},
-                             {"role": "user", "content": "what files are in the root?"},
-                         ]))
-
-    # --verbose: token counts come first, then the call
-    output, _ = run_main(make_response(None, [fn_call("get_files_info", "{}")]), ["list files", "--verbose"])
-    results.append(check("--verbose with a call: prompt and token counts, then the call",
-                         output == "User prompt: list files\n"
-                                   "Prompt tokens: 12\n"
-                                   "Response tokens: 3\n"
-                                   "Calling function: get_files_info({})\n"))
+        # Message shape: a tool message answering this exact call
+        result = call("get_files_info", "{}", call_id="call_xyz")
+        results.append(check("message: exactly role, tool_call_id and content",
+                             result.message is not None
+                             and set(result.message) == {"role", "tool_call_id", "content"}))
+        results.append(check("message: role is 'tool' and the id echoes the call",
+                             result.message is not None and result.message["role"] == "tool"
+                             and result.message["tool_call_id"] == "call_xyz"))
 
     return results
 
@@ -173,132 +189,126 @@ def test_boundaries() -> list[bool]:
     print("=== boundary values ===")
     results: list[bool] = []
 
-    # Number of tool calls: None, 0, 1, 2
-    output: str = output_for(make_response("text", None))
-    results.append(check("tool_calls is None -> text printed", output == "text\n"))
+    with sandbox():
+        listing: str = get_files_info(WORKING_DIR, ".")
 
-    output = output_for(make_response("text", []))
-    results.append(check("tool_calls is [] (0 calls) -> treated as no calls, text printed",
-                         output == "text\n"))
+        # Arguments string: null, empty, and an empty object all mean "no arguments"
+        for label, arguments in [("null", None), ('""', ""), ("{}", "{}")]:
+            result: CallResult = call("get_files_info", arguments)
+            results.append(check(f"arguments {label} -> treated as {{}}", result.content == listing))
 
-    output = output_for(make_response(None, [fn_call("get_files_info", "{}")]))
-    results.append(check("1 call -> exactly 1 line", output == "Calling function: get_files_info({})\n"))
+        result = call("get_files_info", '{"directory": ""}')
+        results.append(check('directory "" -> same as "."', result.content == listing))
 
-    output = output_for(make_response(None, [
-        fn_call("get_files_info", '{"directory": "."}'),
-        fn_call("get_files_info", '{"directory": "pkg"}'),
-    ]))
-    results.append(check("2 calls -> 2 lines, in the order the model sent them",
-                         output == "Calling function: get_files_info({'directory': '.'})\n"
-                                   "Calling function: get_files_info({'directory': 'pkg'})\n"))
+        # Empty results: call_function returns them as is (main.py is the one that refuses them)
+        result = call("get_files_info", '{"directory": "empty_dir"}')
+        results.append(check("empty directory -> content is ''", result.error is None and result.content == ""))
+        result = call("get_file_content", '{"file_path": "empty.txt"}')
+        results.append(check("empty file -> content is ''", result.error is None and result.content == ""))
 
-    # Arguments string: empty string vs an empty JSON object
-    output = output_for(make_response(None, [fn_call("get_files_info", "")]))
-    results.append(check('arguments "" -> treated as {}', output == "Calling function: get_files_info({})\n"))
+        # File length around MAX_CHARS: content passes through, truncation note included
+        make_fixture("calculator/exact.txt", "a" * MAX_CHARS)
+        make_fixture("calculator/over.txt", "a" * (MAX_CHARS + 1))
+        result = call("get_file_content", '{"file_path": "exact.txt"}')
+        results.append(check(f"{MAX_CHARS} chars -> all of it, no truncation note",
+                             result.content == "a" * MAX_CHARS))
+        result = call("get_file_content", '{"file_path": "over.txt"}')
+        results.append(check(f"{MAX_CHARS + 1} chars -> cut at {MAX_CHARS} with the note",
+                             result.content == "a" * MAX_CHARS
+                             + f'[...File "over.txt" truncated at {MAX_CHARS} characters]'))
 
-    output = output_for(make_response(None, [fn_call("get_files_info", '{"directory": ""}')]))
-    results.append(check("empty directory value -> passed through as ''",
-                         output == "Calling function: get_files_info({'directory': ''})\n"))
-
-    # Content: empty string with no calls
-    output = output_for(make_response(""))
-    results.append(check('content "" -> one blank line', output == "\n"))
+        # Script arguments: none, an empty list, one
+        for label, arguments, expected in [
+            ("no args key", '{"file_path": "argv.py"}', "STDOUT:\n[]\n"),
+            ("args []", '{"file_path": "argv.py", "args": []}', "STDOUT:\n[]\n"),
+            ("args [x]", '{"file_path": "argv.py", "args": ["x"]}', "STDOUT:\n['x']\n"),
+        ]:
+            result = call("run_python_file", arguments)
+            results.append(check(f"run_python_file, {label} -> {expected!r}", result.content == expected))
 
     return results
 
 
 def test_decision_table() -> list[bool]:
-    # | Rule | function calls | custom calls | content | expected                                     |
-    # |------|----------------|--------------|---------|----------------------------------------------|
-    # | R1   | 0              | 0            | Y       | content printed                              |
-    # | R2   | 0              | 0            | N       | "None" printed (no guard for this yet)       |
-    # | R3   | >=1            | 0            | N       | one line per call                            |
-    # | R4   | >=1            | 0            | Y       | calls printed, content not printed           |
-    # | R5   | 0              | >=1          | Y       | nothing printed, custom call skipped         |
-    # | R6   | >=1            | >=1          | N       | only the function calls printed              |
+    # | Rule | verbose | arguments  | announcement                       | content        |
+    # |------|---------|------------|------------------------------------|----------------|
+    # | R1   | N       | none       | name only                          | real result    |
+    # | R2   | N       | some       | name only                          | real result    |
+    # | R3   | Y       | none       | name({})                           | real result    |
+    # | R4   | Y       | some       | name({...}) with the model's args  | real result    |
     print("=== decision table ===")
     results: list[bool] = []
-    files_call: str = "Calling function: get_files_info({})\n"
 
-    output: str = output_for(make_response("hello"))
-    results.append(check("R1 no calls, content: content printed", output == "hello\n"))
-
-    output = output_for(make_response(None))
-    results.append(check("R2 no calls, no content: prints 'None'", output == "None\n"))
-
-    output = output_for(make_response(None, [fn_call("get_files_info", "{}")]))
-    results.append(check("R3 function call, no content: call announced", output == files_call))
-
-    output = output_for(make_response("Let me look.", [fn_call("get_files_info", "{}")]))
-    results.append(check("R4 function call, content: only the call announced", output == files_call))
-
-    output = output_for(make_response("Let me look.", [custom_call("grammar_tool")]))
-    results.append(check("R5 custom call only: nothing printed, no crash", output == ""))
-
-    output = output_for(make_response(None, [custom_call("grammar_tool"), fn_call("get_files_info", "{}")]))
-    results.append(check("R6 custom + function call: only the function call announced",
-                         output == files_call))
+    with sandbox():
+        # (rule, verbose, arguments, expected announcement)
+        rules: list[tuple[str, bool, str, str]] = [
+            ("R1", False, "{}", announced("get_files_info")),
+            ("R2", False, '{"directory": "pkg"}', announced("get_files_info")),
+            ("R3", True, "{}", " - Calling function: get_files_info({})\n"),
+            ("R4", True, '{"directory": "pkg"}', " - Calling function: get_files_info({'directory': 'pkg'})\n"),
+        ]
+        for rule, verbose, arguments, expected in rules:
+            result: CallResult = call("get_files_info", arguments, verbose)
+            directory: str = json.loads(arguments).get("directory", ".")
+            results.append(check(f"{rule} verbose={verbose}, args {arguments}: announcement and result",
+                                 result.output == expected
+                                 and result.content == get_files_info(WORKING_DIR, directory)))
 
     return results
 
 
-def test_unknown_functions() -> list[bool]:
-    # The model is only offered functions that exist, and at this step a call is
-    # only announced: nothing gets run, whether the function exists or not
-    print("=== unknown and unoffered functions ===")
+def test_working_directory() -> list[bool]:
+    # The model must never get outside calculator/, and must never pick the working directory
+    print("=== working directory and guardrails ===")
     results: list[bool] = []
 
-    names: list[str] = [tool["function"]["name"] for tool in available_functions]
-    results.append(check(f"offered functions: {names}", names == ["get_files_info"]))
-    results.append(check("every offered tool is a function tool",
-                         all(tool["type"] == "function" for tool in available_functions)))
-    results.append(check("no function is offered twice", len(names) == len(set(names))))
+    with sandbox() as tmp_root:
+        result: CallResult = call("get_files_info", '{"working_directory": "..", "directory": "."}')
+        results.append(check("model sends working_directory '..': ignored, still lists calculator/",
+                             result.content == get_files_info(WORKING_DIR, ".")
+                             and "secret.txt" not in str(result.content)))
 
-    for tool in available_functions:
-        name: str = tool["function"]["name"]
-        func: Callable[..., object] | None = resolve_function(name)
-        results.append(check(f"{name}: exists as functions/{name}.py:{name}()", func is not None))
-        if func is None:
-            continue
-        params: set[str] = set(inspect.signature(func).parameters)
-        properties: set[str] = set(schema_properties(dict(tool)))
-        results.append(check(f"{name}: every schema argument is a real parameter",
-                             properties <= params))
-        # working_directory is injected by us, so the model must never be able to pick it
-        results.append(check(f"{name}: working_directory is not exposed to the model",
-                             "working_directory" not in properties))
+        result = call("get_files_info", '{"directory": "."}', verbose=True)
+        results.append(check("verbose shows the model's arguments, not the injected working_directory",
+                             "working_directory" not in result.output))
 
-    # A made-up function: announced, no crash, nothing else printed
-    output: str = output_for(make_response(None, [fn_call("delete_all_files", '{"path": "/"}')]))
-    results.append(check("made-up function: only announced",
-                         output == "Calling function: delete_all_files({'path': '/'})\n"))
+        result = call("get_file_content", '{"file_path": "../secret.txt"}')
+        results.append(check("read ../secret.txt: refused, secret not returned",
+                             str(result.content).startswith('Error: Cannot read "../secret.txt"')
+                             and "top secret" not in str(result.content)))
 
-    # A name with shell syntax in it: printed as text, never run
-    output = output_for(make_response(None, [fn_call("get_files_info; rm -rf /", "{}")]))
-    results.append(check("name with shell syntax: printed verbatim",
-                         output == "Calling function: get_files_info; rm -rf /({})\n"))
+        secret_path: str = os.path.join(tmp_root, "secret.txt")
+        result = call("get_file_content", json.dumps({"file_path": secret_path}))
+        results.append(check("read the secret by absolute path: refused",
+                             str(result.content).startswith("Error: Cannot read")))
 
-    with tempfile.TemporaryDirectory() as tmp_root:
-        # Real functions that aren't offered yet: a call to them must not touch the disk
-        target: str = os.path.join(tmp_root, "written.txt")
-        args: str = json.dumps({"file_path": target, "content": "pwned"})
-        output = output_for(make_response(None, [fn_call("write_file", args)]))
-        results.append(check("write_file (not offered): announced only, no file written",
-                             output.count("\n") == 1 and not os.path.exists(target)))
+        result = call("write_file", '{"file_path": "../evil.txt", "content": "pwned"}')
+        results.append(check("write ../evil.txt: refused, nothing written",
+                             str(result.content).startswith('Error: Cannot write to "../evil.txt"')
+                             and not os.path.exists(os.path.join(tmp_root, "evil.txt"))))
 
         marker: str = os.path.join(tmp_root, "ran.marker")
-        script: str = os.path.join(tmp_root, "script.py")
-        with open(script, "w", encoding="utf-8") as f:
-            f.write(f"open({marker!r}, 'w').close()\n")
-        args = json.dumps({"file_path": script})
-        output = output_for(make_response(None, [fn_call("run_python_file", args)]))
-        results.append(check("run_python_file (not offered): announced only, script never ran",
-                             output.count("\n") == 1 and not os.path.exists(marker)))
+        make_fixture(os.path.join(tmp_root, "outside.py"), f"open({marker!r}, 'w').close()\n")
+        result = call("run_python_file", '{"file_path": "../outside.py"}')
+        results.append(check("run ../outside.py: refused, script never ran",
+                             str(result.content).startswith('Error: Cannot execute "../outside.py"')
+                             and not os.path.exists(marker)))
 
-    # An offered function isn't run either: no file listing appears after the announcement
-    output = output_for(make_response(None, [fn_call("get_files_info", '{"directory": "."}')]))
-    results.append(check("get_files_info: announced only, no listing printed",
-                         output == "Calling function: get_files_info({'directory': '.'})\n"))
+    # What the model is offered
+    names: list[str] = [tool["function"]["name"] for tool in available_functions]
+    results.append(check(f"offered functions: {names}", names == EXPECTED_FUNCTIONS))
+    results.append(check("every offered function can be called, and nothing else can",
+                         set(function_map) == set(names)))
+    results.append(check("every offered tool is a function tool",
+                         all(tool["type"] == "function" for tool in available_functions)))
+    for tool in available_functions:
+        name: str = tool["function"]["name"]
+        func: Callable[..., str] = function_map[name]
+        params: set[str] = set(inspect.signature(func).parameters)
+        properties: set[str] = set(schema_properties(dict(tool)))
+        results.append(check(f"{name}: every schema argument is a real parameter", properties <= params))
+        results.append(check(f"{name}: working_directory is not exposed to the model",
+                             "working_directory" not in properties))
 
     return results
 
@@ -307,22 +317,46 @@ def test_error_guessing() -> list[bool]:
     print("=== error guessing ===")
     results: list[bool] = []
 
-    # Some providers send null instead of "" when there are no arguments
-    output: str = output_for(make_response(None, [fn_call("get_files_info", None)]))
-    results.append(check("arguments null -> treated as {}", output == "Calling function: get_files_info({})\n"))
+    with sandbox() as tmp_root:
+        # Function-level problems come back as error text the model can read
+        result: CallResult = call("get_files_info", '{"directory": 5}')
+        results.append(check("directory is a number: error text, no crash",
+                             result.error is None and str(result.content).startswith("Error:")))
 
-    # Non-ASCII and spaces survive the JSON round trip
-    output = output_for(make_response(None, [fn_call("get_files_info", '{"directory": "dossier été"}')]))
-    results.append(check("unicode directory name printed intact",
-                         output == "Calling function: get_files_info({'directory': 'dossier été'})\n"))
+        result = call("run_python_file", '{"file_path": "crash.py"}')
+        results.append(check("script that crashes: exit code and stderr returned",
+                             result.content == "Process exited with code 1\nSTDERR:\nboom\n"))
 
-    # Truncated JSON from the model: json.loads isn't guarded yet, so main.py stops with an exception
-    try:
-        output_for(make_response(None, [fn_call("get_files_info", '{"directory": ')]))
-        raised: bool = False
-    except json.JSONDecodeError:
-        raised = True
-    results.append(check("malformed JSON arguments: raises JSONDecodeError (not handled yet)", raised))
+        result = call("get_files_info", '{"directory": "dossier été"}')
+        results.append(check("unicode directory name: listed",
+                             result.content == "- fichier.txt: file_size=8 bytes, is_dir=False"))
+
+        # Not handled yet: these raise instead of telling the model what went wrong
+        result = call("delete_all_files", "{}")
+        results.append(check("made-up function: announced, then KeyError (not handled yet)",
+                             result.output == announced("delete_all_files") and isinstance(result.error, KeyError)))
+
+        marker: str = os.path.join(tmp_root, "shell.marker")
+        result = call(f"get_files_info; touch {marker}", "{}")
+        results.append(check("name with shell syntax: KeyError, nothing run",
+                             isinstance(result.error, KeyError) and not os.path.exists(marker)))
+
+        result = call("get_files_info", '{"directory": ')
+        results.append(check("malformed JSON: JSONDecodeError before anything is announced (not handled yet)",
+                             isinstance(result.error, json.JSONDecodeError) and result.output == ""))
+
+        for arguments in ("[]", "null"):
+            result = call("get_files_info", arguments)
+            results.append(check(f"arguments {arguments} (valid JSON, not an object): TypeError (not handled yet)",
+                                 isinstance(result.error, TypeError)))
+
+        result = call("get_files_info", '{"file_path": "main.py"}')
+        results.append(check("argument the function doesn't take: TypeError (not handled yet)",
+                             isinstance(result.error, TypeError)))
+
+        result = call("get_file_content", "{}")
+        results.append(check("required argument missing: TypeError (not handled yet)",
+                             isinstance(result.error, TypeError)))
 
     return results
 
@@ -333,7 +367,7 @@ def main() -> None:
     results += test_equivalence_partitions()
     results += test_boundaries()
     results += test_decision_table()
-    results += test_unknown_functions()
+    results += test_working_directory()
     results += test_error_guessing()
     print(f"\n{sum(results)}/{len(results)} checks passed")
 
